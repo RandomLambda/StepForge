@@ -20,6 +20,7 @@ from . import (
     fit,
     freeform,
     geometry,
+    jobs,
     param,
     parser,
     tessellate,
@@ -48,6 +49,7 @@ if _needs_reload:
     earcut = importlib.reload(earcut)
     tessellate = importlib.reload(tessellate)
     convert = importlib.reload(convert)
+    jobs = importlib.reload(jobs)
 
 from .convert import Mesh, Solid, convert_step
 from .parser import StepFile, parse_file, parse_string

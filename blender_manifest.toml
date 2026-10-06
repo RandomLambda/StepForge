@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "step_forge"
-version = "3.9.7"
+version = "3.9.8"
 name = "StepForge"
 tagline = "Import & export STEP/STP, pure Python"
 maintainer = "Philip Gruenenfelder"

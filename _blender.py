@@ -12,6 +12,7 @@ import traceback
 import blf
 import bpy
 import gpu
+import numpy as np
 from bpy.props import (
     BoolProperty,
     CollectionProperty,
@@ -23,11 +24,8 @@ from bpy.types import Operator
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 from gpu_extras.batch import batch_for_shader
 
-from .core import brep_export as _brep_export
-from .core.brep_export import iter_export_step_brep
-from .core.convert import iter_convert_step
+from .core import jobs, workers
 from .core.convert import transform_surface_record as _transform_surface_record
-from .core.exporter import export_step
 
 # ---------------------------------------------------------------------------
 # Progress bar overlay, drawn in every 3D viewport during import and export by
@@ -100,34 +98,126 @@ QUALITY_PRESETS = {
 # ---------------------------------------------------------------------------
 # Running long work from a modal operator
 #
-# Import and B-rep export are generators (`iter_convert_step`,
-# `iter_export_step_brep`) that yield `(fraction, message)` between small units
-# of work. The operator's timer runs the generator for a few milliseconds per
-# tick and then hands control back to Blender, so the UI keeps redrawing and
-# shows a progress bar. The generators run on the main thread; the expensive
-# per-face and per-patch work can go to worker processes (`core/workers.py`),
-# which the generators then poll between ticks.
+# Import and export are jobs (`core/jobs.py`): generators that yield plain-data
+# messages. They run in a background process (`core/workers.py`), so the heavy
+# work (parsing, tessellation, curve fitting, writing) never runs in Blender's
+# own process and cannot slow the UI down. What stays here is what only Blender
+# can do: reading mesh data and building it, in short slices.
+#
+# An operator's work is a generator too. It yields `(fraction, text)` for the
+# progress bar, or None for "nothing to do right now". A timer runs it for a
+# few milliseconds per tick and then hands control back to Blender, so the UI
+# keeps redrawing. It only polls the background process and never waits for it.
 # ---------------------------------------------------------------------------
 
 # How long one timer tick may work before yielding to the UI, and how often
 # the timer fires.
-_SLICE_SECONDS = 0.05
+_SLICE_SECONDS = 0.01
 _TIMER_SECONDS = 0.02
 
 
+# False runs everything inside Blender's own process (the work is then divided
+# into slices, but single steps such as parsing can still block the UI).
+_BACKGROUND_PROCESSES = True
+
+
 def _can_use_workers():
-    """False while a script runs as `__main__` (`blender --python`, or a text
-    run from the editor): `multiprocessing` would execute it again in every
-    worker, so those runs stay in-process."""
+    """False if background processes are switched off, or while a script runs as
+    `__main__` (`blender --python`, or a text run from the editor):
+    `multiprocessing` would execute it again in every process it starts, so
+    those runs stay in this process."""
     import __main__
-    return not getattr(__main__, "__file__", None)
+    return _BACKGROUND_PROCESSES and not getattr(__main__, "__file__", None)
+
+
+class _InProcessTask:
+    """Steps a job generator in this process, with the interface of
+    `workers.TaskProcess` (`poll`, `close`). Used where no background process
+    can be used: headless Blender, scripts, a process that failed to start."""
+
+    def __init__(self, gen):
+        self._gen = gen
+        self._finished = False
+
+    def poll(self):
+        if self._finished:
+            return None
+        try:
+            return next(self._gen)
+        except StopIteration as stop:
+            self._finished = True
+            return ("result", stop.value)
+
+    def close(self):
+        self._gen.close()
+
+
+def _run_job(name, state, make_messages=None):
+    """Start the job `name` of `core/jobs.py`; returns `(task, in_background)`.
+
+    In a window session it runs in a background process. Otherwise (headless,
+    a script) or if that process cannot be started, the same generator is
+    stepped in this process. `make_messages()` yields what the job reads from
+    its inbox (see `_drive` for how it is sent to a process)."""
+    state = dict(state)
+    options = dict(state.get("options") or {})
+    state["options"] = options
+    if not bpy.app.background and bpy.context.window is not None and _can_use_workers():
+        if "parallel" in options:
+            options["parallel"] = True
+        try:
+            return workers.TaskProcess(f"jobs:{name}", state), True
+        except Exception:  # noqa: BLE001 - no process available: run in Blender instead
+            print("[StepForge] Could not start the background process; running in "
+                  "Blender (the window stays responsive only between steps):\n"
+                  + traceback.format_exc())
+    if "parallel" in options:
+        options["parallel"] = _can_use_workers()
+    inbox = workers.Inbox(None, list(make_messages()) if make_messages else ())
+    return _InProcessTask(getattr(jobs, name)(state, inbox)), False
+
+
+def _drive(task, on_message, outgoing=None, span=(0.0, 1.0)):
+    """Generator: talk to `task` until its result arrives, and return it.
+
+    Progress messages move the bar inside `span`; any other message goes to
+    `on_message`. `outgoing`, an iterable of messages for a background
+    process, is sent one message per step once the process says it is ready.
+    Yields progress tuples, or None when nothing is to be done right now."""
+    lo, hi = span
+    progress = (lo, "Starting the background process...")
+    out = iter(outgoing if outgoing is not None else ())
+    ready = outgoing is None
+    while True:
+        msg = task.poll()
+        if msg is not None:
+            kind = msg[0]
+            if kind == "result":
+                return msg[1]
+            if kind == "error":
+                raise workers.WorkerError("the background process failed:\n" + msg[1])
+            if kind == "ready":
+                ready = True
+            elif kind == "progress":
+                progress = (lo + (hi - lo) * msg[1], msg[2])
+            else:
+                on_message(msg)
+            yield progress
+            continue
+        if ready:
+            nxt = next(out, None)
+            if nxt is not None:
+                task.send(nxt)
+                yield progress
+                continue
+        yield None
 
 
 class _ModalWork:
     """Mixin for an operator that runs a generator from a modal timer.
 
     Subclasses implement `_done(context, result)` (called with the generator's
-    return value) and `_failed_message`.
+    return value) and `_failed_message`. Esc cancels.
     """
     _failed_message = "StepForge failed (see console)"
     _work = None
@@ -135,8 +225,8 @@ class _ModalWork:
     _draw_handle = None
 
     def _begin(self, context, work):
-        """Start `work`, a generator yielding `(frac_0_1, message)` and
-        returning the value passed to `_done`."""
+        """Start `work`, a generator yielding `(frac_0_1, message)` (or None
+        while it waits) and returning the value passed to `_done`."""
         if _ACTIVE_PROGRESS_OPS:
             self.report({"ERROR"}, "StepForge is already running an import or export")
             return {"CANCELLED"}
@@ -148,7 +238,11 @@ class _ModalWork:
             # modal operator: run to the end right here.
             try:
                 while True:
-                    self._progress = next(work)
+                    item = next(work)
+                    if item is None:
+                        time.sleep(0.005)
+                    else:
+                        self._progress = item
             except StopIteration as stop:
                 return self._done(context, stop.value)
             except Exception:  # noqa: BLE001 - any failure is reported to the user
@@ -164,12 +258,20 @@ class _ModalWork:
         return {"RUNNING_MODAL"}
 
     def modal(self, context, event):
+        if event.type == "ESC" and event.value == "PRESS":
+            self._stop_modal(context)
+            self._work.close()
+            self.report({"WARNING"}, "StepForge: cancelled")
+            return {"CANCELLED"}
         if event.type != "TIMER":
             return {"PASS_THROUGH"}
         deadline = time.monotonic() + _SLICE_SECONDS
         try:
             while time.monotonic() < deadline:
-                self._progress = next(self._work)
+                item = next(self._work)
+                if item is None:
+                    break
+                self._progress = item
         except StopIteration as stop:
             self._stop_modal(context)
             return self._done(context, stop.value)
@@ -207,33 +309,11 @@ class _ModalWork:
 
 # ---------------------------------------------------------------------------
 # Mesh building (main thread only)
+#
+# Building a mesh is a generator that yields between its steps, so the timer
+# can give the UI a turn in between. Only a single Blender call (`from_mesh`,
+# a bmesh operator) cannot be divided.
 # ---------------------------------------------------------------------------
-
-def _build_mesh(solid, merge_distance, shading, smooth_angle_deg, colours=True,
-                scene=None):
-    me = bpy.data.meshes.new(solid.name)
-    me.from_pydata(solid.mesh.verts, [], solid.mesh.faces)
-    face_ids = list(getattr(solid.mesh, "face_ids", ()) or ())
-    if len(face_ids) == len(me.polygons) and face_ids:
-        if colours:
-            _assign_colours(me, solid, face_ids)
-        # Which STEP face each polygon came from; survives the cleanup below
-        # and ordinary editing (new polygons get 0 = unknown). Renumbered to
-        # ids unique in the scene, so joining parts (or instances of one
-        # part) never mixes two faces under one id.
-        renum = _scene_face_ids(scene, face_ids)
-        attr = me.attributes.new(FACE_ID_ATTR, "INT", "FACE")
-        attr.data.foreach_set("value", [renum[f] for f in face_ids])
-        surfaces = getattr(solid, "face_surfaces", None) or {}
-        table = {str(renum[f]): rec for f, rec in surfaces.items() if f in renum}
-        if table:
-            me[SURFACES_PROP] = json.dumps(table, separators=(",", ":"))
-    elif colours:
-        _assign_colours(me, solid, [])
-    me.validate(verbose=False)
-    _cleanup_mesh(me, merge_distance, shading, smooth_angle_deg)
-    return me
-
 
 # Mesh attribute holding each polygon's source STEP face id, and the mesh
 # property holding those faces' exact surfaces (JSON, mesh-local metres):
@@ -242,18 +322,49 @@ def _build_mesh(solid, merge_distance, shading, smooth_angle_deg, colours=True,
 FACE_ID_ATTR = "stepforge_face"
 SURFACES_PROP = "stepforge_surfaces"
 
+# Elements handled between two yields in the loops over a bmesh.
+_LOOP_STEP = 4096
 
-def _scene_face_ids(scene, face_ids):
-    """Map this solid's STEP face ids to ids unique across the scene."""
+
+def _fill_mesh(me, verts, faces):
+    """Put a payload's vertices and triangles into `me`, as `Mesh.from_pydata`
+    does, but from the NumPy arrays (a memory copy instead of a Python loop).
+    Falls back to `from_pydata` if this Blender does not take them."""
+    nv, nf = len(verts), len(faces)
+    try:
+        me.vertices.add(nv)
+        me.loops.add(nf * 3)
+        me.polygons.add(nf)
+        me.vertices.foreach_set("co", verts.astype(np.float32).ravel())
+        me.polygons.foreach_set("loop_start", np.arange(0, nf * 3, 3, dtype=np.int32))
+        me.polygons.foreach_set("vertices", faces.ravel())
+        me.update(calc_edges=True)
+        if len(me.polygons) == nf and (nf == 0 or (
+                tuple(me.polygons[0].vertices) == tuple(faces[0])
+                and tuple(me.polygons[nf - 1].vertices) == tuple(faces[-1]))):
+            return
+    except (RuntimeError, TypeError, ValueError, AttributeError):
+        pass
+    me.clear_geometry()
+    me.from_pydata(verts.tolist(), [], faces.tolist())
+
+
+def _renumber_faces(scene, face_ids):
+    """Ids unique across the scene for one solid's STEP faces, numbered in order
+    of first appearance. Returns (new id per triangle, {old id: new id})."""
     start = int(scene.get("stepforge_next_face_id", 1)) if scene is not None else 1
-    renum = {}
-    for f in face_ids:
-        if f and f not in renum:
-            renum[f] = start + len(renum)
-    renum[0] = 0
+    used = face_ids != 0
+    uniq, first = np.unique(face_ids[used], return_index=True)
+    new = np.empty(len(uniq), dtype=np.int64)
+    new[np.argsort(first, kind="stable")] = start + np.arange(len(uniq))
+    per_tri = np.zeros(len(face_ids), dtype=np.int32)
+    if len(uniq):
+        per_tri[used] = new[np.searchsorted(uniq, face_ids[used])]
+    mapping = dict(zip(uniq.tolist(), new.tolist(), strict=True))
+    mapping[0] = 0
     if scene is not None:
-        scene["stepforge_next_face_id"] = start + len(renum)
-    return renum
+        scene["stepforge_next_face_id"] = start + len(mapping)
+    return per_tri, mapping
 
 
 def _srgb_to_linear(c):
@@ -287,42 +398,45 @@ def _colour_material(rgba):
     return mat
 
 
-def _assign_colours(me, solid, face_ids):
+def _assign_colours(me, payload, face_ids):
     """Material slots from the solid's STYLED_ITEM colours: one slot for the
     solid colour (or an empty slot for uncoloured faces), one per distinct
-    face colour."""
-    base = getattr(solid, "colour", None)
-    fcol = getattr(solid, "face_colours", None) or {}
+    face colour. Slots are numbered in order of first appearance."""
+    base = payload["colour"]
+    fcol = payload["face_colours"]
     if base is None and not fcol:
         return
-    if base is None and face_ids and all(f in fcol for f in face_ids):
+    uniq, first, inverse = np.unique(face_ids, return_index=True, return_inverse=True)
+    order = np.argsort(first, kind="stable")
+    ids = uniq[order].tolist()                 # STEP faces, by first appearance
+    if base is None and len(face_ids) and all(f in fcol for f in ids):
         # every face coloured on its own: the commonest colour is the base
         counts = {}
-        for f in face_ids:
-            counts[fcol[f]] = counts.get(fcol[f], 0) + 1
+        sizes = np.bincount(inverse, minlength=len(uniq))[order].tolist()
+        for f, n in zip(ids, sizes, strict=True):
+            counts[fcol[f]] = counts.get(fcol[f], 0) + n
         base = max(counts, key=counts.get)
-    slots = {}
     me.materials.append(_colour_material(base) if base is not None else None)
-    if not fcol or not face_ids:
+    if not fcol or not len(face_ids):
         return
-    idx = []
-    for fid in face_ids:
-        col = fcol.get(fid)
+    slots = {}
+    slot_of = np.zeros(len(uniq), dtype=np.int32)
+    for rank, f in enumerate(ids):
+        col = fcol.get(f)
         if col is None or col == base:
-            idx.append(0)
             continue
         k = slots.get(col)
         if k is None:
             me.materials.append(_colour_material(col))
             k = slots[col] = len(me.materials) - 1
-        idx.append(k)
-    me.polygons.foreach_set("material_index", idx)
+        slot_of[order[rank]] = k
+    me.polygons.foreach_set("material_index", slot_of[inverse])
 
 
-def _cleanup_mesh(me, merge_distance, shading="AUTO", smooth_angle_deg=30.0):
-    """Weld coincident verts, drop degenerate faces, make normals point
-    consistently outward, and shade the mesh. Uses bmesh, so it works headless
-    without an ops context.
+def _iter_cleanup_mesh(me, merge_distance, shading, smooth_angle_deg, progress):
+    """Generator: weld coincident verts, drop degenerate faces, make normals
+    point consistently outward, and shade the mesh; yields `progress` between
+    the steps. Uses bmesh, so it works headless without an ops context.
 
     `shading`: FLAT (every facet hard), SMOOTH (every facet smooth) or AUTO:
     faces whose normals differ by less than `smooth_angle_deg` are smooth
@@ -334,58 +448,171 @@ def _cleanup_mesh(me, merge_distance, shading="AUTO", smooth_angle_deg=30.0):
     """
     import bmesh
     bm = bmesh.new()
-    bm.from_mesh(me)
-    if merge_distance > 0.0:
-        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=merge_distance)
-    bmesh.ops.dissolve_degenerate(bm, dist=1e-7, edges=bm.edges)
-    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    try:
+        bm.from_mesh(me)
+        yield progress
+        if merge_distance > 0.0:
+            bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=merge_distance)
+            yield progress
+        bmesh.ops.dissolve_degenerate(bm, dist=1e-7, edges=bm.edges)
+        bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+        yield progress
 
-    if shading == "FLAT":
-        for f in bm.faces:
-            f.smooth = False
-    elif shading == "SMOOTH":
-        for f in bm.faces:
-            f.smooth = True
-    else:  # AUTO
-        thresh = math.cos(math.radians(max(0.0, min(180.0, smooth_angle_deg))))
-        for f in bm.faces:
-            f.smooth = True
-        for e in bm.edges:
-            lf = e.link_faces
-            if len(lf) != 2:
-                e.smooth = False
-                continue
-            e.smooth = lf[0].normal.dot(lf[1].normal) >= thresh
-
-    bm.to_mesh(me)
-    bm.free()
+        if shading in ("FLAT", "SMOOTH"):
+            smooth = shading == "SMOOTH"
+            for i, f in enumerate(bm.faces):
+                f.smooth = smooth
+                if not i % _LOOP_STEP:
+                    yield progress
+        else:  # AUTO
+            thresh = math.cos(math.radians(max(0.0, min(180.0, smooth_angle_deg))))
+            for i, f in enumerate(bm.faces):
+                f.smooth = True
+                if not i % _LOOP_STEP:
+                    yield progress
+            for i, e in enumerate(bm.edges):
+                lf = e.link_faces
+                if len(lf) != 2:
+                    e.smooth = False
+                else:
+                    e.smooth = lf[0].normal.dot(lf[1].normal) >= thresh
+                if not i % _LOOP_STEP:
+                    yield progress
+        bm.to_mesh(me)
+    finally:
+        bm.free()
     me.update()
 
 
-def _build_objects(context, solids, file_name, merge_distance, shading,
-                   smooth_angle_deg, colours=True):
-    """One object per solid, named from its STEP product.
+def _iter_build_mesh(payload, build, scene, progress):
+    """Generator: the Blender mesh for one solid's payload, built in steps that
+    yield `progress` in between; returns the mesh."""
+    me = bpy.data.meshes.new(payload["name"])
+    try:
+        _fill_mesh(me, payload["verts"], payload["faces"])
+        yield progress
+        face_ids = payload["face_ids"]
+        if len(face_ids) == len(me.polygons) and len(face_ids):
+            if build["colours"]:
+                _assign_colours(me, payload, face_ids)
+            # Which STEP face each polygon came from; survives the cleanup
+            # below and ordinary editing (new polygons get 0 = unknown).
+            # Renumbered to ids unique in the scene, so joining parts (or
+            # instances of one part) never mixes two faces under one id.
+            per_tri, mapping = _renumber_faces(scene, face_ids)
+            attr = me.attributes.new(FACE_ID_ATTR, "INT", "FACE")
+            attr.data.foreach_set("value", per_tri)
+            entries = [f'"{mapping[f]}":{text}' for f, text in payload["surfaces"].items()
+                       if f in mapping]
+            if entries:
+                me[SURFACES_PROP] = "{" + ",".join(entries) + "}"
+        elif build["colours"]:
+            _assign_colours(me, payload, face_ids[:0])
+        me.validate(verbose=False)
+        yield progress
+        yield from _iter_cleanup_mesh(me, build["merge_distance"], build["shading"],
+                                      build["smooth_angle"], progress)
+    except BaseException:
+        bpy.data.meshes.remove(me)
+        raise
+    return me
+
+
+def _iter_build_objects(payloads, file_name, build, created, lo, hi):
+    """Generator: one object per solid, named from its STEP product; the
+    progress bar moves from `lo` to `hi`. Everything made is appended to
+    `created` (so a cancelled import can remove it again); returns the objects.
 
     A wrapper collection is created ONLY for assemblies / multi-body results;
     a single solid is linked straight into the active collection.
     """
+    context = bpy.context
     target = context.collection  # active collection
-    if len(solids) > 1:
+    if len(payloads) > 1:
         target = bpy.data.collections.new(file_name)
         context.scene.collection.children.link(target)
+        created.append(target)
 
-    created = []
-    for solid in solids:
-        if not solid.mesh.verts:
-            continue
-        me = _build_mesh(solid, merge_distance, shading, smooth_angle_deg, colours,
-                         scene=context.scene)
+    objs = []
+    for i, payload in enumerate(payloads):
+        progress = (lo + (hi - lo) * i / len(payloads),
+                    f"Building {file_name}: {i + 1}/{len(payloads)}")
+        yield progress
+        me = yield from _iter_build_mesh(payload, build, context.scene, progress)
+        created.append(me)
         # The mesh already carries the instance placement (convert_step
         # applies it to the vertices), so the object keeps an identity matrix.
-        ob = bpy.data.objects.new(solid.name, me)
+        ob = bpy.data.objects.new(payload["name"], me)
         target.objects.link(ob)
         created.append(ob)
-    return created
+        objs.append(ob)
+    return objs
+
+
+def _discard(created):
+    """Remove what `_iter_build_objects` made (a cancelled or failed import)."""
+    for idb in reversed(created):
+        try:
+            if isinstance(idb, bpy.types.Object):
+                bpy.data.objects.remove(idb)
+            elif isinstance(idb, bpy.types.Mesh):
+                bpy.data.meshes.remove(idb)
+            elif isinstance(idb, bpy.types.Collection):
+                bpy.data.collections.remove(idb)
+        except ReferenceError:
+            pass  # already gone (joined into another object)
+
+
+# Share of the progress bar for the background conversion; building the
+# objects in Blender takes the rest.
+_CONVERT_SHARE = 0.9
+
+
+def _import_work(paths, options, build):
+    """Generator behind the import operator: the files are converted in the
+    background, then the objects are built here. Returns what `_done` reports."""
+    task, _ = _run_job("import_job", {"paths": paths, "options": options})
+    receiver = jobs.SolidReceiver()
+    payloads = [[] for _ in paths]
+
+    def collect(msg):
+        if msg[0] in jobs.SOLID_KINDS:
+            payload = receiver.feed(msg)
+            if payload is not None:
+                payloads[payload["tag"]].append(payload)
+
+    try:
+        infos = yield from _drive(task, collect, span=(0.0, _CONVERT_SHARE))
+    finally:
+        task.close()
+
+    created, imported = [], []
+    parts = built = 0
+    n_solids = sum(len(group) for group in payloads) or 1
+    try:
+        for path, group in zip(paths, payloads, strict=True):
+            file_name = os.path.splitext(os.path.basename(path))[0]
+            lo = _CONVERT_SHARE + (1.0 - _CONVERT_SHARE) * built / n_solids
+            built += len(group)
+            hi = _CONVERT_SHARE + (1.0 - _CONVERT_SHARE) * built / n_solids
+            objs = yield from _iter_build_objects(group, file_name, build, created, lo, hi)
+            group.clear()
+            parts += len(objs)
+            if build["join"] and len(objs) > 1:
+                yield hi, f"Joining {file_name}..."
+                _join(bpy.context, objs, file_name)
+                objs = objs[:1]
+            imported.extend(objs)
+        _select_objects(bpy.context, imported)
+    except BaseException:
+        _discard(created)
+        raise
+    return {
+        "parts": parts,
+        "n_faces": sum(info["n_faces"] for info in infos),
+        "n_failed": sum(info["n_failed"] for info in infos),
+        "lines": [line for info in infos for line in info["lines"]],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -525,54 +752,23 @@ class STEPFORGE_OT_import(_ModalWork, Operator, ImportHelper):
             defl, max_edge = QUALITY_PRESETS[quality]
         scale = {"MM": 0.001, "M": 1.0, "AUTO": None}[self.unit]
         # Read the properties now: the work below runs after execute()
-        # returns.
+        # returns. ("parallel" is only a switch: `_run_job` sets it.)
         options = {
             "deflection": defl, "scale": scale, "max_edge": max_edge,
             "debug": self.debug, "relative_pct": relative_pct,
             "flat_max_edge": bool(self.flat_max_edge and self.manual),
-            "parallel": _can_use_workers(),
+            "parallel": True,
         }
-        return self._begin(context, self._import_work(paths, options))
+        build = {
+            "merge_distance": self.merge_distance, "shading": self.shading,
+            "smooth_angle": self.smooth_angle, "colours": self.import_colours,
+            "join": self.join_solids,
+        }
+        return self._begin(context, _import_work(paths, options, build))
 
-    @staticmethod
-    def _import_work(paths, options):
-        """Generator: convert every file; returns [(path, solids), ...]."""
-        results = []
-        n_files = len(paths) or 1
-        for file_i, path in enumerate(paths):
-            gen = iter_convert_step(path, **options)
-            while True:
-                try:
-                    frac, msg = next(gen)
-                except StopIteration as done:
-                    results.append((path, done.value))
-                    break
-                yield (file_i + frac) / n_files, msg
-        return results
-
-    def _done(self, context, results):
-        return self._build_results(context, results)
-
-    def _build_results(self, context, results):
-        total = 0
-        n_faces = n_failed = 0
-        warnings = []
-        imported = []
-        for path, solids in results:
-            file_name = os.path.splitext(os.path.basename(path))[0]
-            objs = _build_objects(context, solids, file_name,
-                                  self.merge_distance, self.shading,
-                                  self.smooth_angle, self.import_colours)
-            total += len(objs)
-            if self.join_solids and len(objs) > 1:
-                _join(context, objs, file_name)
-                objs = objs[:1]
-            imported.extend(objs)
-            n_faces += getattr(solids, "n_faces", 0)
-            n_failed += len(getattr(solids, "failed_faces", ()))
-            if hasattr(solids, "summary_lines"):
-                warnings.extend(solids.summary_lines(os.path.basename(path)))
-        _select_objects(context, imported)
+    def _done(self, context, summary):
+        total, n_faces, n_failed = summary["parts"], summary["n_faces"], summary["n_failed"]
+        warnings = summary["lines"]
         for line in warnings:
             print("[StepForge] " + line)
         if n_failed:
@@ -774,68 +970,41 @@ class STEPFORGE_OT_export(_ModalWork, Operator, ExportHelper):
     def execute(self, context):
         objs = (context.selected_objects if self.use_selection
                 else context.scene.objects)
-        meshes = [o for o in objs if o.type == "MESH"]
-        if not meshes:
+        names = [o.name for o in objs if o.type == "MESH"]
+        if not names:
             self.report({"ERROR"}, "No mesh objects to export")
             return {"CANCELLED"}
 
-        # The plain verts/faces solids need bpy (mesh evaluation, optional
-        # bmesh coplanar merge), so they are built here. The slow curve fitting
-        # and B-rep assembly then run as a generator from the modal timer, as
-        # in import.
+        # Reading the meshes needs bpy (mesh evaluation, optional bmesh
+        # coplanar merge) and happens here in short steps; the curve fitting
+        # and the writing run in the background (see `_export_work`).
         angle = self.optimize_angle if (self.write_mode == "TESSELLATED"
                                          and self.optimize_mesh) else None
-        solids = [_object_to_solid(o, angle) for o in meshes]
-        if not self.keep_source_surfaces:
-            for sol in solids:
-                sol.face_surfaces = {}
-
-        if self.write_mode != "BREP":
-            # Writing the mesh as-is is a single quick pass.
-            try:
-                export_step(solids, self.filepath, scale=self.scale)
-            except Exception:  # noqa: BLE001 - any failure is reported to the user
-                return self._failed(context)
-            self._report_result(len(solids), self.write_mode, None)
-            return {"FINISHED"}
-
-        # Freeform Tolerance (always) and, when Manual Settings is off, Curve
-        # Fit Tolerance too are percentages of each solid's own bounding-box
-        # longest edge (see `export_step_brep`), so a small part in an
-        # assembly is not fitted to a tolerance sized for the whole scene.
-        options = {
-            "tolerance_mm": self.fit_tolerance,
-            "smooth_angle_deg": self.smooth_angle,
-            "scale": self.scale,
-            "line_angle_tol_deg": self.line_angle_tolerance,
-            "freeform": self.freeform_surfaces,
-            "tolerance_pct": None if self.manual else self.fit_tolerance_pct,
-            "freeform_tolerance_pct": (self.freeform_tolerance_pct
-                                       if self.freeform_surfaces else None),
-            "keep_source_surfaces": self.keep_source_surfaces,
-            "parallel": _can_use_workers(),
-        }
-        return self._begin(context,
-                           self._export_work(solids, self.filepath, options))
-
-    @staticmethod
-    def _export_work(solids, path, options):
-        """Generator: fit and write the B-rep; returns (n_solids, stats)."""
-        gen = iter_export_step_brep(solids, path, **options)
-        while True:
-            try:
-                step = next(gen)
-            except StopIteration as done:
-                stats_obj = done.value
-                break
-            yield step
-        stats = {f: getattr(stats_obj, f) for f in _brep_export.STAT_FIELDS}
-        stats["freeform_achievable_mm"] = stats_obj.freeform_achievable_mm
-        return len(solids), stats
+        job = {"path": self.filepath, "mode": self.write_mode, "scale": self.scale,
+               "options": {}}
+        if self.write_mode == "BREP":
+            # Freeform Tolerance (always) and, when Manual Settings is off,
+            # Curve Fit Tolerance too are percentages of each solid's own
+            # bounding-box longest edge (see `export_step_brep`), so a small
+            # part in an assembly is not fitted to a tolerance sized for the
+            # whole scene. ("parallel" is only a switch: `_run_job` sets it.)
+            job["options"] = {
+                "tolerance_mm": self.fit_tolerance,
+                "smooth_angle_deg": self.smooth_angle,
+                "scale": self.scale,
+                "line_angle_tol_deg": self.line_angle_tolerance,
+                "freeform": self.freeform_surfaces,
+                "tolerance_pct": None if self.manual else self.fit_tolerance_pct,
+                "freeform_tolerance_pct": (self.freeform_tolerance_pct
+                                           if self.freeform_surfaces else None),
+                "keep_source_surfaces": self.keep_source_surfaces,
+                "parallel": True,
+            }
+        return self._begin(context, _export_work(
+            names, angle, self.keep_source_surfaces, job))
 
     def _done(self, context, result):
-        n_solids, stats = result
-        self._report_result(n_solids, "BREP", stats)
+        self._report_result(result["n_solids"], self.write_mode, result["stats"])
         return {"FINISHED"}
 
     def _report_result(self, n_solids, write_mode, stats):
@@ -871,73 +1040,106 @@ class STEPFORGE_OT_export(_ModalWork, Operator, ExportHelper):
             self.report({"INFO"}, f"StepForge: exported {n_solids} object(s)")
 
 
-class _SimpleMesh:
-    __slots__ = ("face_ids", "faces", "verts")
+def _export_work(names, optimize_angle_deg, keep_surfaces, job):
+    """Generator behind the export operator: read each mesh object here (one per
+    step), then fit and write in the background. Returns the job's result."""
+    payloads = []
+    for i, name in enumerate(names):
+        obj = bpy.data.objects.get(name)
+        if obj is None or obj.type != "MESH":
+            continue
+        progress = (0.1 * i / len(names), f"Reading {name}...")
+        yield progress
+        payloads.append((yield from _iter_object_payload(
+            obj, optimize_angle_deg, keep_surfaces, progress)))
+    job["n_solids"] = len(payloads)
+
+    def messages():
+        for i, payload in enumerate(payloads):
+            yield from jobs.payload_messages(i, payload)
+
+    task, in_background = _run_job("export_job", job, messages)
+    try:
+        return (yield from _drive(task, lambda msg: None,
+                                  messages() if in_background else None,
+                                  span=(0.1, 1.0)))
+    finally:
+        task.close()
 
 
-class _SimpleSolid:
-    __slots__ = ("face_surfaces", "mesh", "name")
-
-
-def _object_to_solid(obj, optimize_angle_deg=None):
-    me = obj.to_mesh()
+def _iter_object_payload(obj, optimize_angle_deg, keep_surfaces, progress):
+    """Generator: the plain-data form (see `core/jobs.py`) of a mesh object, in
+    world space, n-gons fan-triangulated; read from the mesh with NumPy. Yields
+    `progress` between its steps and returns the payload."""
+    source = me = obj.to_mesh()
     mat = obj.matrix_world
+    try:
+        yield progress
+        if optimize_angle_deg is not None:
+            me = yield from _iter_optimize_mesh_copy(source, optimize_angle_deg, progress)
 
-    if optimize_angle_deg is not None:
-        me = _optimize_mesh_copy(me, optimize_angle_deg)
+        co = np.empty(len(me.vertices) * 3, dtype=np.float32)
+        me.vertices.foreach_get("co", co)
+        m32 = np.array(mat, dtype=np.float32)
+        verts = (co.reshape(-1, 3) @ m32[:3, :3].T + m32[:3, 3]).astype(np.float64)
 
-    verts = [tuple(mat @ v.co) for v in me.vertices]
-    attr = me.attributes.get(FACE_ID_ATTR)
-    poly_ids = None
-    if attr is not None and attr.domain == "FACE" and attr.data_type == "INT":
-        poly_ids = [0] * len(me.polygons)
-        attr.data.foreach_get("value", poly_ids)
-    faces = []
-    face_ids = []
-    for pi, poly in enumerate(me.polygons):
-        vs = list(poly.vertices)
-        for i in range(1, len(vs) - 1):  # fan-triangulate n-gons
-            faces.append((vs[0], vs[i], vs[i + 1]))
-            face_ids.append(poly_ids[pi] if poly_ids is not None else 0)
-    sm = _SimpleMesh()
-    sm.verts = verts
-    sm.faces = faces
-    sm.face_ids = face_ids
-    ss = _SimpleSolid()
-    ss.name = obj.name
-    ss.mesh = sm
-    ss.face_surfaces = {}
-    raw = obj.data.get(SURFACES_PROP) if poly_ids is not None else None
-    if raw:
-        try:
-            m = [list(r) for r in mat]
-            for k, rec in json.loads(raw).items():
-                tr = _transform_surface_record(rec, m)
-                if tr is not None:
-                    ss.face_surfaces[int(k)] = tr
-        except (ValueError, TypeError, KeyError):
-            ss.face_surfaces = {}
-    obj.to_mesh_clear()
-    if optimize_angle_deg is not None:
-        bpy.data.meshes.remove(me)
-    return ss
+        n_poly, n_loop = len(me.polygons), len(me.loops)
+        starts = np.empty(n_poly, dtype=np.int32)
+        me.polygons.foreach_get("loop_start", starts)
+        corner = np.empty(n_loop, dtype=np.int32)
+        me.loops.foreach_get("vertex_index", corner)
+        poly_ids = None
+        attr = me.attributes.get(FACE_ID_ATTR)
+        if attr is not None and attr.domain == "FACE" and attr.data_type == "INT":
+            poly_ids = np.empty(n_poly, dtype=np.int32)
+            attr.data.foreach_get("value", poly_ids)
+
+        # fan-triangulate: polygon p with k corners gives (0, i, i + 1), i = 1..k-2
+        sizes = np.diff(np.append(starts, n_loop))
+        n_tri = np.maximum(sizes - 2, 0)
+        tri_poly = np.repeat(np.arange(n_poly), n_tri)
+        i = np.arange(len(tri_poly)) - np.repeat(np.cumsum(n_tri) - n_tri, n_tri)
+        base = starts[tri_poly]
+        faces = np.stack([corner[base], corner[base + i + 1], corner[base + i + 2]],
+                         axis=1).astype(np.int32)
+        face_ids = (poly_ids[tri_poly].astype(np.int64) if poly_ids is not None
+                    else np.zeros(len(tri_poly), dtype=np.int64))
+    finally:
+        obj.to_mesh_clear()
+        if me is not source:
+            bpy.data.meshes.remove(me)
+
+    raw = obj.data.get(SURFACES_PROP) if poly_ids is not None and keep_surfaces else None
+    return {
+        "name": obj.name,
+        "verts": verts,
+        "faces": faces,
+        "face_ids": face_ids,
+        "surfaces_json": str(raw) if raw else "",
+        "matrix": [list(r) for r in mat],
+    }
 
 
-def _optimize_mesh_copy(me, angle_deg):
-    """Return a NEW mesh datablock: `me`'s triangles with near-coplanar faces
-    merged (limited dissolve) and re-triangulated. Leaves `me` untouched;
-    caller is responsible for freeing the returned datablock."""
+def _iter_optimize_mesh_copy(me, angle_deg, progress):
+    """Generator: a NEW mesh datablock with `me`'s triangles, near-coplanar
+    faces merged (limited dissolve) and re-triangulated. Leaves `me` untouched;
+    the caller frees the returned datablock. Yields `progress` between steps."""
     import bmesh
     bm = bmesh.new()
-    bm.from_mesh(me)
-    bmesh.ops.dissolve_limit(
-        bm, angle_limit=math.radians(max(0.0, angle_deg)),
-        use_dissolve_boundaries=False,
-        verts=bm.verts, edges=bm.edges, delimit={"NORMAL"})
-    bmesh.ops.triangulate(bm, faces=bm.faces)
-    out = bpy.data.meshes.new(me.name + "_optimized")
-    bm.to_mesh(out)
-    bm.free()
+    try:
+        bm.from_mesh(me)
+        yield progress
+        bmesh.ops.dissolve_limit(
+            bm, angle_limit=math.radians(max(0.0, angle_deg)),
+            use_dissolve_boundaries=False,
+            verts=bm.verts, edges=bm.edges, delimit={"NORMAL"})
+        yield progress
+        bmesh.ops.triangulate(bm, faces=bm.faces)
+        yield progress
+        out = bpy.data.meshes.new(me.name + "_optimized")
+        bm.to_mesh(out)
+    finally:
+        bm.free()
     return out
 
 
