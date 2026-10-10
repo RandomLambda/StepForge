@@ -331,9 +331,19 @@ class StepFile:
 
     # --- lookup helpers -----------------------------------------------------
     def get(self, ref) -> Instance | None:
+        # An inline typed value (`NULL_STYLE(.NULL.)`, `LENGTH_MEASURE(25.4)`)
+        # is parsed as an Instance(id=-1); it is already the entity the caller
+        # is after, so hand it straight back instead of looking it up.
+        if isinstance(ref, Instance):
+            return ref
         if ref is None or isinstance(ref, Derived):
             return None
-        return self.instances.get(int(ref))
+        try:
+            return self.instances.get(int(ref))
+        except (TypeError, ValueError):
+            # A malformed or unexpected reference value must never abort a
+            # whole import: treat it as an unresolved entity.
+            return None
 
     def of_type(self, *names: str) -> list[Instance]:
         names = set(names)
