@@ -43,10 +43,15 @@ def _item_transform(sf, idt):
         return np.eye(4)
 
 
-def _nauo_transform(sf, nauo_id):
-    """Find the transform associated with a NAUO via a
-    CONTEXT_DEPENDENT_SHAPE_REPRESENTATION -> (REPRESENTATION_RELATIONSHIP +
-    REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION -> ITEM_DEFINED_TRANSFORMATION)."""
+def _nauo_transforms(sf):
+    """Map every NAUO id to its placement transform, in a single pass over the
+    CONTEXT_DEPENDENT_SHAPE_REPRESENTATION records.
+
+    Each NAUO looks its transform up in this index. The previous code instead
+    scanned all CDSR records once per NAUO, i.e. O(NAUO x CDSR); an assembly
+    with a few thousand instances of each (2.4 million lookups on a real Voron
+    model) spent minutes here before any tessellation began."""
+    index = {}
     for cdsr in sf.of_type("CONTEXT_DEPENDENT_SHAPE_REPRESENTATION"):
         # params: (representation_relation, represented_product_relation=PDS->NAUO)
         rpr = cdsr.params[1] if len(cdsr.params) > 1 else None
@@ -55,7 +60,7 @@ def _nauo_transform(sf, nauo_id):
             continue
         # PRODUCT_DEFINITION_SHAPE.definition may point at the NAUO
         definition = pds.params[-1] if pds.params else None
-        if definition is None or int(definition) != int(nauo_id):
+        if definition is None:
             continue
         rr = sf.get(cdsr.params[0])
         if rr is None:
@@ -65,8 +70,9 @@ def _nauo_transform(sf, nauo_id):
         for x in rec.params:
             idt = sf.get(x) if not isinstance(x, (str, list)) else None
             if idt is not None and idt.name == "ITEM_DEFINED_TRANSFORMATION":
-                return _item_transform(sf, idt)
-    return np.eye(4)
+                index.setdefault(int(definition), _item_transform(sf, idt))
+                break
+    return index
 
 
 def build_tree(sf):
@@ -78,13 +84,14 @@ def build_tree(sf):
         return None
     children = {}
     child_ids = set()
+    nauo_mat = _nauo_transforms(sf)
     for n in nauos:
         p = n.params
         # (id, name, description, relating_pd(parent), related_pd(child), ...)
         parent = int(p[3])
         child = int(p[4])
         inst_name = str(p[1]) if p[1] else ""
-        mat = _nauo_transform(sf, n.id)
+        mat = nauo_mat.get(int(n.id), np.eye(4))
         children.setdefault(parent, []).append((child, mat, inst_name))
         child_ids.add(child)
     all_parents = set(children.keys())
