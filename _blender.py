@@ -18,6 +18,7 @@ from bpy.props import (
     CollectionProperty,
     EnumProperty,
     FloatProperty,
+    IntProperty,
     StringProperty,
 )
 from bpy.types import Operator
@@ -93,6 +94,30 @@ QUALITY_PRESETS = {
     "FINE": (0.05, 4.0),
     "VERY_FINE": (0.015, 2.0),
 }
+
+
+class STEPFORGE_AddonPreferences(bpy.types.AddonPreferences):
+    """StepForge's preferences (Edit > Preferences > Add-ons > StepForge)."""
+    bl_idname = __package__
+
+    worker_cores: IntProperty(
+        name="Worker cores",
+        description=("How many worker processes import and export may run at "
+                     "once. 0 chooses automatically (every logical CPU, capped)"),
+        default=0, min=0, max=256)
+
+    def draw(self, context):
+        self.layout.prop(self, "worker_cores")
+
+
+def _preferred_workers():
+    """The 'Worker cores' preference, or None for 'choose automatically'."""
+    try:
+        prefs = bpy.context.preferences.addons[__package__].preferences
+    except (KeyError, AttributeError):
+        return None
+    n = int(getattr(prefs, "worker_cores", 0))
+    return n if n > 0 else None
 
 
 # ---------------------------------------------------------------------------
@@ -757,7 +782,7 @@ class STEPFORGE_OT_import(_ModalWork, Operator, ImportHelper):
             "deflection": defl, "scale": scale, "max_edge": max_edge,
             "debug": self.debug, "relative_pct": relative_pct,
             "flat_max_edge": bool(self.flat_max_edge and self.manual),
-            "parallel": True,
+            "parallel": True, "max_workers": _preferred_workers(),
         }
         build = {
             "merge_distance": self.merge_distance, "shading": self.shading,
@@ -998,7 +1023,7 @@ class STEPFORGE_OT_export(_ModalWork, Operator, ExportHelper):
                 "freeform_tolerance_pct": (self.freeform_tolerance_pct
                                            if self.freeform_surfaces else None),
                 "keep_source_surfaces": self.keep_source_surfaces,
-                "parallel": True,
+                "parallel": True, "max_workers": _preferred_workers(),
             }
         return self._begin(context, _export_work(
             names, angle, self.keep_source_surfaces, job))
@@ -1158,6 +1183,7 @@ def _menu_export(self, context):
 
 
 _classes = (
+    STEPFORGE_AddonPreferences,
     STEPFORGE_OT_import,
     STEPFORGE_FH_import,
     STEPFORGE_OT_export,

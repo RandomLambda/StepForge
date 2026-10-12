@@ -1162,16 +1162,32 @@ def _planar_only_edges(sf, face_refs):
 
 
 def _register_edge_hints(sf, face_ref, deflection, edge_hints, max_edge=None):
+    """Merge one face's straight-edge spacing hints into `edge_hints` (the
+    shortest spacing wins). See `_face_edge_hints`."""
+    for edge_ref, width in _face_edge_hints(sf, face_ref, deflection,
+                                            max_edge).items():
+        prev = edge_hints.get(edge_ref)
+        if prev is None or width < prev:
+            edge_hints[edge_ref] = width
+
+
+def _face_edge_hints(sf, face_ref, deflection, max_edge=None):
+    """The `{edge_ref: cell_width}` straight-edge spacing hints one face
+    contributes, or `{}` if it contributes none.
+
+    Split out from `_register_edge_hints` so the same computation runs in a
+    worker (`_edge_hints_job`) without touching the shared hint dict: the merge
+    is a pure min, so doing it per face in any order gives the same result."""
     face = sf.get(face_ref)
     if face is None:
-        return
+        return {}
     surf_ref = face.params[2]
     surface = T.build_surface(sf, surf_ref)
     # B-spline faces get no hint: densifying their boundary edges measured
     # worse every time (a new boundary point that lies slightly off a fitted
     # surface can invert to a wrong (u, v) and fold the boundary ring).
     if not isinstance(surface, (G.Cylinder, G.Cone)):
-        return
+        return {}
     bounds_refs = face.params[1]
     tmp_cache = {}
     all_u = []
@@ -1205,12 +1221,12 @@ def _register_edge_hints(sf, face_ref, deflection, edge_hints, max_edge=None):
             all_u.append(u)
             all_v.append(v)
     if not line_edge_refs or not all_u:
-        return
+        return {}
     if surface.periodic_u:
         all_u = T._unwrap(all_u, surface.period_u)
     u_extent = max(all_u) - min(all_u)
     if u_extent <= 1e-9:
-        return
+        return {}
     r = surface.r if isinstance(surface, G.Cylinder) else surface.r_ref
     r = max(abs(r), 1e-6)
     nu = G._angular_cells(u_extent, r, deflection)
@@ -1218,10 +1234,12 @@ def _register_edge_hints(sf, face_ref, deflection, edge_hints, max_edge=None):
     # the interior grid has at most MAX_AXIAL_CELLS cells along the axis
     # (`Cylinder.grid_cells`): spacing the straight edges the same way
     cell_width = max(cell_width, (max(all_v) - min(all_v)) / G.MAX_AXIAL_CELLS)
+    hints = {}
     for edge_ref in line_edge_refs:
-        prev = edge_hints.get(edge_ref)
+        prev = hints.get(edge_ref)
         if prev is None or cell_width < prev:
-            edge_hints[edge_ref] = cell_width
+            hints[edge_ref] = cell_width
+    return hints
 
 
 def _all_points_extent(sf: StepFile):
@@ -1445,12 +1463,114 @@ def _quick_bbox_longest_edge(sf: StepFile) -> float:
 MIN_FACES_FOR_POOL = 48
 
 
+def _edge_hints_job(state):
+    """Worker-side factory (see `workers.serve`): get the parsed file, then
+    compute a batch of faces' straight-edge spacing hints per call (batched
+    because each face's own work is tiny -- one face per IPC message would
+    spend all its time in round-trips). Mirrors `_register_edge_hints`, but
+    returns the merged hints as plain data for the parent. On POSIX the parent
+    forks this worker *after* parsing, so `state["sf"]` is inherited
+    copy-on-write; only a spawned worker parses."""
+    sf = state.get("sf")
+    if sf is None:
+        sf = parse_file(state["path"])
+        sf.angle_scale = state["angle_scale"]
+
+    def run(face_refs):
+        T.take_unsupported()
+        msgs: list[str] = []
+        hints: dict[int, float] = {}
+        for face_ref in face_refs:
+            try:
+                found = _face_edge_hints(sf, face_ref, state["deflection"],
+                                         state["max_edge"])
+            except Exception:  # noqa: BLE001 - a face without hints is tessellated without them
+                if state["debug"]:
+                    import traceback
+                    msgs.append(f"[StepForge] face {face_ref}: edge hints "
+                                f"raised, skipped:\n{traceback.format_exc()}")
+                continue
+            for e, w in found.items():
+                prev = hints.get(e)
+                if prev is None or w < prev:
+                    hints[e] = w
+        unsup = {k: {int(i) for i in ids} for k, ids in T.take_unsupported().items()}
+        return hints, msgs, unsup
+    return run
+
+
+def _edge_hints_pooled(path, sf, face_refs, deflection, max_edge,
+                       debug, debug_log, max_workers, chunk=256):
+    """Generator: compute `face_refs`' edge-hint contributions on worker
+    processes. Yields `(frac, msg)`; returns `({edge_ref: cell_width},
+    unsupported)` or None if the workers failed (the caller then runs the
+    sequential loop). The merge is a plain min over faces, so the result equals
+    the sequential one, and the hints are complete before tessellation is
+    dispatched either way.
+
+    Workers are forked where possible so they share `sf` instead of each
+    re-parsing; on any failure it retries with spawned workers, then gives up.
+    """
+    refs = [int(r) for r in face_refs]
+    total = len(refs)
+    n = W.worker_count(max_workers, total)
+    chunks = [refs[i:i + chunk] for i in range(0, total, chunk)]
+    base_state = {"path": path, "angle_scale": sf.angle_scale,
+                  "deflection": deflection, "max_edge": max_edge, "debug": debug}
+    methods = ("fork", "spawn") if W.supports_fork() else ("spawn",)
+    for mi, method in enumerate(methods):
+        state = base_state
+        if method == "fork":
+            state = dict(base_state, sf=sf)   # inherited, never pickled
+        hints: dict[int, float] = {}
+        unsupported: dict[tuple[str, str], set] = {}
+        done = 0
+        msg = f"Preparing edge hints: {total} face(s) on {n} core(s)..."
+        try:
+            with W.WorkerPool("convert:_edge_hints_job", state, n,
+                              start_method=method) as pool:
+                for out in pool.imap(chunks):
+                    if out is not None:
+                        ci, (found, msgs, unsup) = out
+                        for e, w in found.items():
+                            prev = hints.get(e)
+                            if prev is None or w < prev:
+                                hints[e] = w
+                        if debug:
+                            for m in msgs:
+                                debug_log(m)
+                        for k, ids in unsup.items():
+                            unsupported.setdefault(k, set()).update(ids)
+                        done += len(chunks[ci])
+                        msg = (f"Preparing edge hints: {total} face(s) on "
+                               f"{n} core(s): {done}/{total}")
+                    yield 0.02 + 0.03 * (done / total), msg
+            return hints, unsupported
+        except Exception:  # noqa: BLE001 - any worker failure means "run single-core"
+            if debug:
+                import traceback
+                debug_log(f"[StepForge] parallel edge hints on '{method}' "
+                          f"failed:\n{traceback.format_exc()}")
+            if mi == len(methods) - 1:
+                return None
+            yield 0.02, (f"Parallel edge hints on '{method}' failed; "
+                         f"retrying on '{methods[mi + 1]}'...")
+    return None
+
+
 def _tessellate_job(state):
-    """Worker-side factory (see `workers.serve`): parse the file once, then
+    """Worker-side factory (see `workers.serve`): get the parsed file, then
     tessellate one face per call. Mirrors the sequential per-face code in
-    `iter_convert_step`. Returns plain data only."""
-    sf = parse_file(state["path"])
-    sf.angle_scale = state["angle_scale"]
+    `iter_convert_step`. Returns plain data only.
+
+    On POSIX the parent forks this worker *after* parsing, so `state["sf"]` is
+    already there and inherited copy-on-write -- no per-worker parse (which
+    costs seconds and gigabytes on a big file). Only a spawned worker (the
+    fallback) has to parse for itself."""
+    sf = state.get("sf")
+    if sf is None:
+        sf = parse_file(state["path"])
+        sf.angle_scale = state["angle_scale"]
 
     def run(face_ref):
         T.take_unsupported()
@@ -1480,40 +1600,55 @@ def _tessellate_pooled(path, sf, face_refs, deflection, max_edge, edge_hints,
     falls back to the sequential path). Faces are independent of each other
     (`edge_hints` is complete before any is dispatched and a shared edge is
     always sampled in its own fixed direction), so the output equals the
-    sequential one; the welding stays sequential in the caller."""
+    sequential one; the welding stays sequential in the caller.
+
+    Workers are forked where possible so they share `sf` instead of each
+    re-parsing the file; if that fails (no fork, or a worker dies) the pool is
+    retried with spawned workers, and failing that the caller goes single-core.
+    """
     refs = [int(r) for r in face_refs]
     total = len(refs)
     n = W.worker_count(max_workers, total)
-    state = {"path": path, "angle_scale": sf.angle_scale,
-             "deflection": deflection, "max_edge": max_edge, "debug": debug,
-             "flat_max_edge": flat_max_edge,
-             "edge_hints": {int(k): float(v) for k, v in edge_hints.items()}}
-    results: dict[int, tuple] = {}
-    unsupported: dict[tuple[str, str], set] = {}
-    done = 0
-    msg = f"Tessellating {total} face(s) on {n} core(s)..."
-    try:
-        with W.WorkerPool("convert:_tessellate_job", state, n) as pool:
-            for out in pool.imap(refs):
-                if out is not None:
-                    i, (verts3d, tris, msgs, unsup) = out
-                    results[refs[i]] = (verts3d, tris)
-                    if debug:
-                        for m in msgs:
-                            debug_log(m)
-                    for k, ids in unsup.items():
-                        unsupported.setdefault(k, set()).update(ids)
-                    done += 1
-                    msg = (f"Tessellating {total} face(s) on {n} core(s): "
-                           f"{done}/{total}")
-                yield 0.05 + 0.9 * (done / total), msg
-    except Exception:  # noqa: BLE001 - any worker failure means "run single-core"
-        if debug:
-            import traceback
-            debug_log("[StepForge] parallel tessellation failed, falling back "
-                      f"to single-core:\n{traceback.format_exc()}")
-        return None
-    return results, unsupported
+    base_state = {"path": path, "angle_scale": sf.angle_scale,
+                  "deflection": deflection, "max_edge": max_edge, "debug": debug,
+                  "flat_max_edge": flat_max_edge,
+                  "edge_hints": {int(k): float(v) for k, v in edge_hints.items()}}
+    methods = ("fork", "spawn") if W.supports_fork() else ("spawn",)
+    for mi, method in enumerate(methods):
+        state = base_state
+        if method == "fork":
+            state = dict(base_state, sf=sf)   # inherited, never pickled
+        results: dict[int, tuple] = {}
+        unsupported: dict[tuple[str, str], set] = {}
+        done = 0
+        msg = f"Tessellating {total} face(s) on {n} core(s)..."
+        try:
+            with W.WorkerPool("convert:_tessellate_job", state, n,
+                              start_method=method) as pool:
+                for out in pool.imap(refs):
+                    if out is not None:
+                        i, (verts3d, tris, msgs, unsup) = out
+                        results[refs[i]] = (verts3d, tris)
+                        if debug:
+                            for m in msgs:
+                                debug_log(m)
+                        for k, ids in unsup.items():
+                            unsupported.setdefault(k, set()).update(ids)
+                        done += 1
+                        msg = (f"Tessellating {total} face(s) on {n} core(s): "
+                               f"{done}/{total}")
+                    yield 0.05 + 0.9 * (done / total), msg
+            return results, unsupported
+        except Exception:  # noqa: BLE001 - any worker failure means "try again/fewer"
+            if debug:
+                import traceback
+                debug_log(f"[StepForge] parallel tessellation on '{method}' "
+                          f"failed:\n{traceback.format_exc()}")
+            if mi == len(methods) - 1:
+                return None
+            yield 0.05, (f"Parallel tessellation on '{method}' failed; "
+                         f"retrying on '{methods[mi + 1]}'...")
+    return None
 
 
 def convert_step(src, deflection: float = 0.05, scale: float | None = None,
@@ -1651,15 +1786,34 @@ def iter_convert_step(src, deflection: float = 0.05,
         for e in _planar_only_edges(sf, all_face_refs):
             edge_hints[e] = math.inf
     n_hint_faces = len(all_face_refs)
-    for i, fref in enumerate(all_face_refs):
-        try:
-            _register_edge_hints(sf, fref, deflection, edge_hints, max_edge)
-        except Exception:  # noqa: BLE001, S110 - a face without hints is tessellated without them
-            pass
-        yield (0.02 + 0.03 * ((i + 1) / max(n_hint_faces, 1)),
-               f"Preparing edge hints: {i + 1}/{n_hint_faces} face(s)...")
+    hint_unsupported: dict[tuple[str, str], set] = {}
+    hints_pooled = False
+    if (parallel and isinstance(src, (str, os.PathLike))
+            and n_hint_faces >= MIN_FACES_FOR_POOL):
+        pooled = yield from _edge_hints_pooled(
+            os.fspath(src), sf, all_face_refs, deflection, max_edge,
+            debug, debug_log, max_workers)
+        if pooled is not None:
+            found, hint_unsupported = pooled
+            for e, w in found.items():
+                prev = edge_hints.get(e)
+                if prev is None or w < prev:
+                    edge_hints[e] = w
+            hints_pooled = True
+    if not hints_pooled:
+        for i, fref in enumerate(all_face_refs):
+            try:
+                _register_edge_hints(sf, fref, deflection, edge_hints, max_edge)
+            except Exception:  # noqa: BLE001, S110 - a face without hints is tessellated without them
+                pass
+            yield (0.02 + 0.03 * ((i + 1) / max(n_hint_faces, 1)),
+                   f"Preparing edge hints: {i + 1}/{n_hint_faces} face(s)...")
 
-    unsupported: dict[tuple[str, str], set] = {}
+    # Unsupported-curve types seen while computing hints come back from the
+    # workers; the sequential path leaves them in the module-level tally that
+    # is drained below instead.
+    unsupported: dict[tuple[str, str], set] = {
+        k: set(v) for k, v in hint_unsupported.items()}
     failed_faces: list[int] = []
     face_results = None
     if (parallel and isinstance(src, (str, os.PathLike))
