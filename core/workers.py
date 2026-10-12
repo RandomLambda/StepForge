@@ -49,14 +49,26 @@ class WorkerError(RuntimeError):
     """A background process died, failed to start, or reported an error."""
 
 
+def supports_fork() -> bool:
+    """True when worker processes can be forked, so they inherit the parent's
+    already-parsed data (copy-on-write) instead of re-parsing the file. Only
+    POSIX platforms offer this."""
+    try:
+        return "fork" in multiprocessing.get_all_start_methods()
+    except Exception:  # noqa: BLE001 - any lookup failure just means "no"
+        return False
+
+
 def worker_count(requested=None, n_jobs=None) -> int:
-    """Pool size: `requested` if given, else half the logical CPUs (capped), so
-    that Blender's own threads always have cores to run on; never more than
-    `n_jobs` and never less than 1."""
+    """Pool size: `requested` if given, else every logical CPU (capped), so
+    an import can use the whole machine. Workers run at below-normal priority
+    and, where they are forked, do not re-parse the file, so the UI still has
+    a core to run on; `requested` (the add-on preference) can always lower it.
+    Never more than `n_jobs` and never less than 1."""
     if requested and requested > 0:
         n = int(requested)
     else:
-        n = max(1, min((os.cpu_count() or 2) // 2, MAX_WORKERS))
+        n = max(1, min(os.cpu_count() or 2, MAX_WORKERS))
     if n_jobs is not None:
         n = max(1, min(n, n_jobs))
     return n
@@ -246,8 +258,8 @@ class WorkerPool:
     """`n` worker processes running one job. Use as a context manager (or
     call `close`); leaving early terminates the workers."""
 
-    def __init__(self, job: str, state, n: int):
-        ctx = multiprocessing.get_context("spawn")
+    def __init__(self, job: str, state, n: int, start_method: str = "spawn"):
+        ctx = multiprocessing.get_context(start_method)
         self._procs = []
         self._conns = []
         try:
