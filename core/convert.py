@@ -1446,11 +1446,18 @@ MIN_FACES_FOR_POOL = 48
 
 
 def _tessellate_job(state):
-    """Worker-side factory (see `workers.serve`): parse the file once, then
+    """Worker-side factory (see `workers.serve`): get the parsed file, then
     tessellate one face per call. Mirrors the sequential per-face code in
-    `iter_convert_step`. Returns plain data only."""
-    sf = parse_file(state["path"])
-    sf.angle_scale = state["angle_scale"]
+    `iter_convert_step`. Returns plain data only.
+
+    On POSIX the parent forks this worker *after* parsing, so `state["sf"]` is
+    already there and inherited copy-on-write -- no per-worker parse (which
+    costs seconds and gigabytes on a big file). Only a spawned worker (the
+    fallback) has to parse for itself."""
+    sf = state.get("sf")
+    if sf is None:
+        sf = parse_file(state["path"])
+        sf.angle_scale = state["angle_scale"]
 
     def run(face_ref):
         T.take_unsupported()
@@ -1480,40 +1487,55 @@ def _tessellate_pooled(path, sf, face_refs, deflection, max_edge, edge_hints,
     falls back to the sequential path). Faces are independent of each other
     (`edge_hints` is complete before any is dispatched and a shared edge is
     always sampled in its own fixed direction), so the output equals the
-    sequential one; the welding stays sequential in the caller."""
+    sequential one; the welding stays sequential in the caller.
+
+    Workers are forked where possible so they share `sf` instead of each
+    re-parsing the file; if that fails (no fork, or a worker dies) the pool is
+    retried with spawned workers, and failing that the caller goes single-core.
+    """
     refs = [int(r) for r in face_refs]
     total = len(refs)
     n = W.worker_count(max_workers, total)
-    state = {"path": path, "angle_scale": sf.angle_scale,
-             "deflection": deflection, "max_edge": max_edge, "debug": debug,
-             "flat_max_edge": flat_max_edge,
-             "edge_hints": {int(k): float(v) for k, v in edge_hints.items()}}
-    results: dict[int, tuple] = {}
-    unsupported: dict[tuple[str, str], set] = {}
-    done = 0
-    msg = f"Tessellating {total} face(s) on {n} core(s)..."
-    try:
-        with W.WorkerPool("convert:_tessellate_job", state, n) as pool:
-            for out in pool.imap(refs):
-                if out is not None:
-                    i, (verts3d, tris, msgs, unsup) = out
-                    results[refs[i]] = (verts3d, tris)
-                    if debug:
-                        for m in msgs:
-                            debug_log(m)
-                    for k, ids in unsup.items():
-                        unsupported.setdefault(k, set()).update(ids)
-                    done += 1
-                    msg = (f"Tessellating {total} face(s) on {n} core(s): "
-                           f"{done}/{total}")
-                yield 0.05 + 0.9 * (done / total), msg
-    except Exception:  # noqa: BLE001 - any worker failure means "run single-core"
-        if debug:
-            import traceback
-            debug_log("[StepForge] parallel tessellation failed, falling back "
-                      f"to single-core:\n{traceback.format_exc()}")
-        return None
-    return results, unsupported
+    base_state = {"path": path, "angle_scale": sf.angle_scale,
+                  "deflection": deflection, "max_edge": max_edge, "debug": debug,
+                  "flat_max_edge": flat_max_edge,
+                  "edge_hints": {int(k): float(v) for k, v in edge_hints.items()}}
+    methods = ("fork", "spawn") if W.supports_fork() else ("spawn",)
+    for mi, method in enumerate(methods):
+        state = base_state
+        if method == "fork":
+            state = dict(base_state, sf=sf)   # inherited, never pickled
+        results: dict[int, tuple] = {}
+        unsupported: dict[tuple[str, str], set] = {}
+        done = 0
+        msg = f"Tessellating {total} face(s) on {n} core(s)..."
+        try:
+            with W.WorkerPool("convert:_tessellate_job", state, n,
+                              start_method=method) as pool:
+                for out in pool.imap(refs):
+                    if out is not None:
+                        i, (verts3d, tris, msgs, unsup) = out
+                        results[refs[i]] = (verts3d, tris)
+                        if debug:
+                            for m in msgs:
+                                debug_log(m)
+                        for k, ids in unsup.items():
+                            unsupported.setdefault(k, set()).update(ids)
+                        done += 1
+                        msg = (f"Tessellating {total} face(s) on {n} core(s): "
+                               f"{done}/{total}")
+                    yield 0.05 + 0.9 * (done / total), msg
+            return results, unsupported
+        except Exception:  # noqa: BLE001 - any worker failure means "try again/fewer"
+            if debug:
+                import traceback
+                debug_log(f"[StepForge] parallel tessellation on '{method}' "
+                          f"failed:\n{traceback.format_exc()}")
+            if mi == len(methods) - 1:
+                return None
+            yield 0.05, (f"Parallel tessellation on '{method}' failed; "
+                         f"retrying on '{methods[mi + 1]}'...")
+    return None
 
 
 def convert_step(src, deflection: float = 0.05, scale: float | None = None,
